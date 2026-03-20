@@ -268,6 +268,188 @@ def ppo_logprob_entropy_from_traj(policy: nn.Module, obs_traj: torch.Tensor, act
     return torch.stack(logprob_list), torch.stack(entropy_list)
 
 
+def ppo_logprob_entropy_from_stream(
+    policy: nn.Module,
+    obs_seq: torch.Tensor,
+    act_seq: torch.Tensor,
+    done_seq: torch.Tensor,
+):
+    """
+    Recompute log-probabilities + entropy for a single environment stream,
+    where `done_seq[t] == 1` indicates the episode terminated *after* step t.
+
+    For recurrent policies, we reset hidden state at episode boundaries so
+    log-prob computation matches how actions were sampled during rollout.
+    """
+    hidden = None
+    logprob_list = []
+    entropy_list = []
+    T = int(obs_seq.shape[0])
+
+    for t in range(T):
+        if t > 0 and bool(done_seq[t - 1].item()):
+            hidden = None
+
+        obs_t = obs_seq[t].unsqueeze(0).unsqueeze(0)
+        mu, std, hidden = policy.forward(obs_t, hidden)
+        mu = mu.squeeze(0).squeeze(0)
+        dist = torch.distributions.Normal(mu, std)
+
+        act_t = act_seq[t]
+        raw_t = _raw_action_from_squashed(policy, act_t)
+        log_det_jacobian = 2.0 * (
+            np.log(2.0) - raw_t - torch.nn.functional.softplus(-2.0 * raw_t)
+        )
+        log_prob_t = dist.log_prob(raw_t).sum(-1) - log_det_jacobian.sum(-1)
+        entropy_t = dist.entropy().sum(-1)
+
+        logprob_list.append(log_prob_t)
+        entropy_list.append(entropy_t)
+
+    return torch.stack(logprob_list), torch.stack(entropy_list)
+
+
+def _zero_hidden_for_indices(hidden, idx: torch.Tensor):
+    """
+    Zero hidden state for recurrent policies at specified batch indices.
+    idx: 1D tensor of indices to reset.
+    """
+    if hidden is None:
+        return None
+    if torch.is_tensor(hidden):
+        hidden = hidden.clone()
+        hidden[:, idx, :] = 0.0
+        return hidden
+    if isinstance(hidden, (tuple, list)) and len(hidden) == 2:
+        h, c = hidden
+        h = h.clone()
+        c = c.clone()
+        h[:, idx, :] = 0.0
+        c[:, idx, :] = 0.0
+        return (h, c)
+    # Unknown hidden structure; return as-is.
+    return hidden
+
+
+def collect_rollout_batch(
+    envs: list,
+    policy: nn.Module,
+    device,
+    rollout_steps: int,
+    reset_seed_base: int | None,
+    episode_idx: int,
+):
+    """
+    Collect fixed-length rollouts across multiple envs in the same process.
+    Uses auto-reset when `done` occurs so we can keep a constant batch size.
+    """
+    n_envs = int(len(envs))
+    rollout_steps = int(rollout_steps)
+    k = int(getattr(policy, "obs_history_k", 1) or 1)
+
+    # Reset all envs.
+    obs_hist = []
+    obs_batch_list = []
+    for i in range(n_envs):
+        seed_i = None
+        if reset_seed_base is not None:
+            seed_i = int(reset_seed_base + episode_idx * n_envs + i)
+        obs_np = envs[i].reset(seed=seed_i)
+        if k > 1:
+            hist = [np.asarray(obs_np, dtype=np.float32).copy() for _ in range(k)]
+            obs_hist.append(hist)
+            obs_stack = np.concatenate(hist, axis=0)
+            obs_batch_list.append(obs_stack)
+        else:
+            obs_hist.append(None)
+            obs_batch_list.append(np.asarray(obs_np, dtype=np.float32))
+
+    obs_batch = torch.as_tensor(
+        np.stack(obs_batch_list, axis=0), dtype=torch.float32, device=device
+    )  # (B, obs_dim)
+
+    hidden = None
+    obs_store = []
+    act_store = []
+    logprob_store = []
+    reward_store = []
+    done_store = []
+
+    for _t in range(rollout_steps):
+        obs_seq = obs_batch.unsqueeze(1)  # (B,1,obs_dim)
+
+        with torch.no_grad():
+            action, log_prob, hidden = policy.sample_action(obs_seq, hidden)
+
+        # Store action/logprob as constants for PPO.
+        act_step = action[:, 0, :].detach()  # (B, action_dim)
+        logp_step = log_prob[:, 0].detach()  # (B,)
+
+        actions_np = act_step.cpu().numpy()
+
+        next_obs_batch = []
+        reward_step = np.zeros((n_envs,), dtype=np.float32)
+        done_step = np.zeros((n_envs,), dtype=np.float32)
+        done_indices = []
+
+        for i in range(n_envs):
+            obs_next, reward, done, _info = envs[i].step(actions_np[i])
+            reward_step[i] = float(reward)
+            done_step[i] = 1.0 if done else 0.0
+
+            if done:
+                # Reset env immediately so obs_batch stays valid for next step.
+                seed_i = None
+                if reset_seed_base is not None:
+                    seed_i = int(reset_seed_base + episode_idx * n_envs + i)
+                obs_reset = envs[i].reset(seed=seed_i)
+                if k > 1:
+                    hist = [np.asarray(obs_reset, dtype=np.float32).copy() for _ in range(k)]
+                    obs_hist[i] = hist
+                    obs_next_stack = np.concatenate(hist, axis=0)
+                else:
+                    obs_next_stack = np.asarray(obs_reset, dtype=np.float32)
+                done_indices.append(i)
+            else:
+                if k > 1:
+                    obs_hist[i].pop(0)
+                    obs_hist[i].append(np.asarray(obs_next, dtype=np.float32))
+                    obs_next_stack = np.concatenate(obs_hist[i], axis=0)
+                else:
+                    obs_next_stack = np.asarray(obs_next, dtype=np.float32)
+
+            next_obs_batch.append(obs_next_stack)
+
+        if done_indices:
+            idx = torch.as_tensor(done_indices, dtype=torch.long, device=device)
+            hidden = _zero_hidden_for_indices(hidden, idx)
+
+        obs_batch = torch.as_tensor(
+            np.stack(next_obs_batch, axis=0), dtype=torch.float32, device=device
+        )
+
+        obs_store.append(obs_seq.squeeze(1))  # (B, obs_dim)
+        act_store.append(act_step)
+        logprob_store.append(logp_step)
+        reward_store.append(torch.as_tensor(reward_step, device=device))
+        done_store.append(torch.as_tensor(done_step, device=device))
+
+    # (T,B,...) tensors
+    obs_tensor = torch.stack(obs_store, dim=0)
+    act_tensor = torch.stack(act_store, dim=0)
+    logprob_tensor = torch.stack(logprob_store, dim=0)
+    reward_tensor = torch.stack(reward_store, dim=0)
+    done_tensor = torch.stack(done_store, dim=0)
+
+    return {
+        "obs": obs_tensor,
+        "act": act_tensor,
+        "logprob": logprob_tensor,
+        "reward": reward_tensor,
+        "done": done_tensor,
+    }
+
+
 def collect_episode(
     env: TurretEnv,
     policy: nn.Module,
@@ -433,6 +615,8 @@ def train(
     ppo_clip_coef: float = 0.2,
     ppo_value_coef: float = 0.5,
     ppo_entropy_coef: float = 0.01,
+    batch_envs: int = 1,
+    rollout_steps: int = 200,
 ):
     # Disable simulator debug visuals/logs during training.
     # This does not affect the training progress prints in this file.
@@ -539,14 +723,48 @@ def train(
     recent_losses = deque(maxlen=max(1, int(debug_window)))
     recent_eval = deque(maxlen=max(1, int(debug_window)))
 
+    batch_envs = int(batch_envs)
+    rollout_steps = int(rollout_steps)
+    if batch_envs < 1:
+        raise ValueError(f"batch_envs must be >= 1, got {batch_envs}")
+    using_batch = algo == "ppo" and batch_envs > 1
+    batch_envs_list = None
+    if using_batch:
+        batch_envs_list = []
+        for i in range(batch_envs):
+            batch_envs_list.append(
+                TurretEnv(
+                    action_is_correction=True,
+                    correction_baseline="panel",
+                    shot_base_penalty=shot_base_penalty,
+                    shot_miss_penalty_scale=shot_miss_penalty_scale,
+                    shot_miss_target_radius_mm=shot_miss_target_radius_mm,
+                    shot_miss_penalty_power=shot_miss_penalty_power,
+                    shot_miss_max_ratio=shot_miss_max_ratio,
+                    shot_miss_max_angle_deg=shot_miss_max_angle_deg,
+                    seed=None if seed is None else int(seed + i),
+                )
+            )
+
     for episode in range(1, n_episodes + 1):
 
-        traj = collect_episode(
-            env,
-            policy,
-            device,
-            reset_seed=None if seed is None else int(seed + episode),
-        )
+        traj = None
+        if algo == "ppo" and batch_envs > 1:
+            traj = collect_rollout_batch(
+                envs=batch_envs_list,
+                policy=policy,
+                device=device,
+                rollout_steps=rollout_steps,
+                reset_seed_base=seed,
+                episode_idx=episode,
+            )
+        else:
+            traj = collect_episode(
+                env,
+                policy,
+                device,
+                reset_seed=None if seed is None else int(seed + episode),
+            )
 
         grad_norm = 0.0
         if algo == "reinforce":
@@ -582,73 +800,183 @@ def train(
             optimizer.step()
             loss_item = float(loss.item())
         else:
-            obs_traj = traj["obs"].detach()
-            act_traj = traj["act"].detach()
-            old_logprob = traj["logprob"].detach()
-            returns = compute_returns(traj["reward"], gamma=0.99).detach()
-
-            with torch.no_grad():
-                values_old = value_net(obs_traj)
-                advantages = returns - values_old
-                adv_std = advantages.std(unbiased=False) if advantages.numel() > 1 else torch.tensor(1.0, device=device)
-                advantages = (advantages - advantages.mean()) / (adv_std + 1e-8)
-
+            # PPO update
             policy_losses = []
             value_losses = []
             entropy_vals = []
 
-            for ppo_epoch_idx in range(max(1, int(ppo_epochs))):
-                new_logprob, entropy = ppo_logprob_entropy_from_traj(policy, obs_traj, act_traj)
-                if episode == 1 and ppo_epoch_idx == 0:
-                    # Sanity check: recomputing log-probabilities from stored
-                    # (squashed) actions should closely match `old_logprob`.
-                    with torch.no_grad():
-                        logprob_diff = float((new_logprob - old_logprob).abs().mean().item())
-                        ratio_mean = float(torch.exp(new_logprob - old_logprob).mean().item())
-                    print(
-                        f"PPO logprob sanity: mean|new-old|={logprob_diff:.6f}, ratio_mean={ratio_mean:.4f}"
+            if algo == "ppo" and batch_envs > 1:
+                # Batched fixed-length rollout with auto-reset.
+                obs_seq = traj["obs"].detach()  # (T,B,obs_dim)
+                act_seq = traj["act"].detach()  # (T,B,action_dim)
+                old_logprob = traj["logprob"].detach()  # (T,B)
+                reward_seq = traj["reward"].detach()  # (T,B)
+                done_seq = traj["done"].detach()  # (T,B) float/bool
+
+                T, B, obs_dim_eff = int(obs_seq.shape[0]), int(obs_seq.shape[1]), int(obs_seq.shape[2])
+
+                # Compute discounted returns with episode boundaries masked by `done`.
+                gamma = 0.99
+                returns_seq = torch.zeros((T, B), device=device, dtype=reward_seq.dtype)
+                G = torch.zeros((B,), device=device, dtype=reward_seq.dtype)
+                for t in range(T - 1, -1, -1):
+                    G = reward_seq[t] + gamma * G * (1.0 - done_seq[t])
+                    returns_seq[t] = G
+
+                obs_flat = obs_seq.reshape(T * B, obs_dim_eff)
+                act_flat = act_seq.reshape(T * B, int(act_seq.shape[2]))
+                old_logprob_flat = old_logprob.reshape(T * B)
+                returns_flat = returns_seq.reshape(T * B)
+
+                with torch.no_grad():
+                    values_old = value_net(obs_flat)
+                    advantages = returns_flat - values_old
+                    adv_std = (
+                        advantages.std(unbiased=False)
+                        if advantages.numel() > 1
+                        else torch.tensor(1.0, device=device)
                     )
-                ratio = torch.exp(new_logprob - old_logprob)
-                surr1 = ratio * advantages
-                surr2 = torch.clamp(
-                    ratio,
-                    1.0 - float(ppo_clip_coef),
-                    1.0 + float(ppo_clip_coef),
-                ) * advantages
-                policy_loss = -torch.min(surr1, surr2).mean()
+                    advantages = (advantages - advantages.mean()) / (adv_std + 1e-8)
 
-                value_pred = value_net(obs_traj)
-                value_loss = torch.nn.functional.mse_loss(value_pred, returns)
-                entropy_bonus = entropy.mean()
+                for ppo_epoch_idx in range(max(1, int(ppo_epochs))):
+                    new_logprob_list = []
+                    entropy_list = []
+                    # Recompute per-env stream so RNN hidden resets match episode boundaries.
+                    for i in range(B):
+                        new_lp_i, ent_i = ppo_logprob_entropy_from_stream(
+                            policy,
+                            obs_seq[:, i, :],
+                            act_seq[:, i, :],
+                            done_seq[:, i],
+                        )
+                        new_logprob_list.append(new_lp_i)
+                        entropy_list.append(ent_i)
 
-                total_loss = (
-                    policy_loss
-                    + float(ppo_value_coef) * value_loss
-                    - float(ppo_entropy_coef) * entropy_bonus
-                )
+                    new_logprob_seq = torch.stack(new_logprob_list, dim=1)  # (T,B)
+                    entropy_seq = torch.stack(entropy_list, dim=1)  # (T,B)
+                    new_logprob_flat = new_logprob_seq.reshape(T * B)
+                    entropy_flat = entropy_seq.reshape(T * B)
 
-                optimizer.zero_grad(set_to_none=True)
-                value_optimizer.zero_grad(set_to_none=True)
-                total_loss.backward()
+                    if episode == 1 and ppo_epoch_idx == 0:
+                        # Sanity check: should match old log-probs closely.
+                        with torch.no_grad():
+                            logprob_diff = float((new_logprob_flat - old_logprob_flat).abs().mean().item())
+                            ratio_mean = float(torch.exp(new_logprob_flat - old_logprob_flat).mean().item())
+                        print(
+                            f"PPO batched logprob sanity: mean|new-old|={logprob_diff:.6f}, ratio_mean={ratio_mean:.4f}"
+                        )
 
-                grad_norm_sq = 0.0
-                for p in policy.parameters():
-                    if p.grad is not None:
-                        grad_norm_sq += float(p.grad.detach().norm(2).item() ** 2)
-                grad_norm = float(np.sqrt(grad_norm_sq))
+                    ratio = torch.exp(new_logprob_flat - old_logprob_flat)
+                    surr1 = ratio * advantages
+                    surr2 = torch.clamp(
+                        ratio,
+                        1.0 - float(ppo_clip_coef),
+                        1.0 + float(ppo_clip_coef),
+                    ) * advantages
+                    policy_loss = -torch.min(surr1, surr2).mean()
 
-                if grad_clip_norm is not None and grad_clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float(grad_clip_norm))
-                    torch.nn.utils.clip_grad_norm_(value_net.parameters(), max_norm=float(grad_clip_norm))
+                    value_pred = value_net(obs_flat)
+                    value_loss = torch.nn.functional.mse_loss(value_pred, returns_flat)
+                    entropy_bonus = entropy_flat.mean()
 
-                optimizer.step()
-                value_optimizer.step()
+                    total_loss = (
+                        policy_loss
+                        + float(ppo_value_coef) * value_loss
+                        - float(ppo_entropy_coef) * entropy_bonus
+                    )
 
-                policy_losses.append(float(policy_loss.item()))
-                value_losses.append(float(value_loss.item()))
-                entropy_vals.append(float(entropy_bonus.item()))
+                    optimizer.zero_grad(set_to_none=True)
+                    value_optimizer.zero_grad(set_to_none=True)
+                    total_loss.backward()
 
-            loss_item = float(np.mean(policy_losses)) if policy_losses else 0.0
+                    grad_norm_sq = 0.0
+                    for p in policy.parameters():
+                        if p.grad is not None:
+                            grad_norm_sq += float(p.grad.detach().norm(2).item() ** 2)
+                    grad_norm = float(np.sqrt(grad_norm_sq))
+
+                    if grad_clip_norm is not None and grad_clip_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float(grad_clip_norm))
+                        torch.nn.utils.clip_grad_norm_(value_net.parameters(), max_norm=float(grad_clip_norm))
+
+                    optimizer.step()
+                    value_optimizer.step()
+
+                    policy_losses.append(float(policy_loss.item()))
+                    value_losses.append(float(value_loss.item()))
+                    entropy_vals.append(float(entropy_bonus.item()))
+
+                loss_item = float(np.mean(policy_losses)) if policy_losses else 0.0
+
+            else:
+                # Existing single-env PPO update (variable-length episode)
+                obs_traj = traj["obs"].detach()
+                act_traj = traj["act"].detach()
+                old_logprob = traj["logprob"].detach()
+                returns = compute_returns(traj["reward"], gamma=0.99).detach()
+
+                with torch.no_grad():
+                    values_old = value_net(obs_traj)
+                    advantages = returns - values_old
+                    adv_std = (
+                        advantages.std(unbiased=False)
+                        if advantages.numel() > 1
+                        else torch.tensor(1.0, device=device)
+                    )
+                    advantages = (advantages - advantages.mean()) / (adv_std + 1e-8)
+
+                for ppo_epoch_idx in range(max(1, int(ppo_epochs))):
+                    new_logprob, entropy = ppo_logprob_entropy_from_traj(policy, obs_traj, act_traj)
+                    if episode == 1 and ppo_epoch_idx == 0:
+                        # Sanity check: recomputing log-probabilities from stored
+                        # (squashed) actions should closely match `old_logprob`.
+                        with torch.no_grad():
+                            logprob_diff = float((new_logprob - old_logprob).abs().mean().item())
+                            ratio_mean = float(torch.exp(new_logprob - old_logprob).mean().item())
+                        print(
+                            f"PPO logprob sanity: mean|new-old|={logprob_diff:.6f}, ratio_mean={ratio_mean:.4f}"
+                        )
+                    ratio = torch.exp(new_logprob - old_logprob)
+                    surr1 = ratio * advantages
+                    surr2 = torch.clamp(
+                        ratio,
+                        1.0 - float(ppo_clip_coef),
+                        1.0 + float(ppo_clip_coef),
+                    ) * advantages
+                    policy_loss = -torch.min(surr1, surr2).mean()
+
+                    value_pred = value_net(obs_traj)
+                    value_loss = torch.nn.functional.mse_loss(value_pred, returns)
+                    entropy_bonus = entropy.mean()
+
+                    total_loss = (
+                        policy_loss
+                        + float(ppo_value_coef) * value_loss
+                        - float(ppo_entropy_coef) * entropy_bonus
+                    )
+
+                    optimizer.zero_grad(set_to_none=True)
+                    value_optimizer.zero_grad(set_to_none=True)
+                    total_loss.backward()
+
+                    grad_norm_sq = 0.0
+                    for p in policy.parameters():
+                        if p.grad is not None:
+                            grad_norm_sq += float(p.grad.detach().norm(2).item() ** 2)
+                    grad_norm = float(np.sqrt(grad_norm_sq))
+
+                    if grad_clip_norm is not None and grad_clip_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float(grad_clip_norm))
+                        torch.nn.utils.clip_grad_norm_(value_net.parameters(), max_norm=float(grad_clip_norm))
+
+                    optimizer.step()
+                    value_optimizer.step()
+
+                    policy_losses.append(float(policy_loss.item()))
+                    value_losses.append(float(value_loss.item()))
+                    entropy_vals.append(float(entropy_bonus.item()))
+
+                loss_item = float(np.mean(policy_losses)) if policy_losses else 0.0
         if hasattr(policy, "log_std") and isinstance(policy.log_std, torch.nn.Parameter):
             # Gradually reduce exploration while keeping a floor so policy can adapt.
             with torch.no_grad():
@@ -662,8 +990,15 @@ def train(
         if save_current_every and (episode % int(save_current_every) == 0):
             torch.save(policy.state_dict(), current_model_path)
 
-        total_return = traj["reward"].sum().item()
-        ep_len = int(len(traj["reward"]))
+        if using_batch:
+            # reward is (T,B)
+            rewards = traj["reward"]
+            # Mean return per env across the batch rollout.
+            total_return = float(rewards.sum(dim=0).mean().item())
+            ep_len = rollout_steps
+        else:
+            total_return = traj["reward"].sum().item()
+            ep_len = int(len(traj["reward"]))
         recent_returns.append(float(total_return))
         recent_lengths.append(ep_len)
         recent_losses.append(float(loss_item))
@@ -756,6 +1091,8 @@ if __name__ == "__main__":
     parser.add_argument("--ppo-clip-coef", type=float, default=0.2)
     parser.add_argument("--ppo-value-coef", type=float, default=0.5)
     parser.add_argument("--ppo-entropy-coef", type=float, default=0.01)
+    parser.add_argument("--batch-envs", type=int, default=1)
+    parser.add_argument("--rollout-steps", type=int, default=200)
     args = parser.parse_args()
 
     train(
@@ -791,4 +1128,6 @@ if __name__ == "__main__":
         ppo_clip_coef=args.ppo_clip_coef,
         ppo_value_coef=args.ppo_value_coef,
         ppo_entropy_coef=args.ppo_entropy_coef,
+        batch_envs=args.batch_envs,
+        rollout_steps=args.rollout_steps,
     )

@@ -31,7 +31,7 @@ def test_policy(
     obs_dim = obs_dim_base * mlp_k if model == "mlp" else obs_dim_base
     if model_path is None:
         if model == "gru":
-            model_path = "best_policy_gru.pt"
+            model_path = "notebook_best.pt"
         elif model == "lstm":
             model_path = "best_policy_lstm.pt"
         elif model == "mlp":
